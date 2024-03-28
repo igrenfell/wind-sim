@@ -4,6 +4,71 @@ library(sandwich)
 library(forecast)
 library(fitdistrplus)
 library(tseries)
+library(zoo)
+
+
+convert.fft <- function(cs, sample.rate=1) {
+  cs <- cs / length(cs) # normalize
+  
+  distance.center <- function(c)signif( Mod(c),        4)
+  angle           <- function(c)signif( 180*Arg(c)/pi, 3)
+  
+  df <- data.frame(cycle    = 0:(length(cs)-1),
+                   freq     = 0:(length(cs)-1) * sample.rate / length(cs),
+                   strength = sapply(cs, distance.center),
+                   delay    = sapply(cs, angle))
+  df
+}
+
+
+plot.frequency.spectrum <- function(X.k, xlimits=c(0,length(X.k))) {
+  plot.data  <- cbind(0:(length(X.k)-1), Mod(X.k))
+  
+  # TODO: why this scaling is necessary?
+  plot.data[2:length(X.k),2] <- 2*plot.data[2:length(X.k),2] 
+  
+  plot(plot.data, t="h", lwd=2, main="", 
+       xlab="Frequency (Hz)", ylab="Strength", 
+       xlim=xlimits, ylim=c(0,max(Mod(plot.data[,2]))))
+}
+
+get.trajectory <- function(X.k,ts,acq.freq) {
+  
+  N   <- length(ts)
+  i   <- complex(real = 0, imaginary = 1)
+  x.n <- rep(0,N)           # create vector to keep the trajectory
+  ks  <- 0:(length(X.k)-1)
+  
+  for(n in 0:(N-1)) {       # compute each time point x_n based on freqs X.k
+    x.n[n+1] <- sum(X.k * exp(i*2*pi*ks*n/N)) / N
+  }
+  
+  x.n * acq.freq 
+}
+
+
+f   <- function(t,w) { 
+  dc.component + 
+    sum( component.strength * sin(component.freqs*w*t + component.delay)) 
+}
+
+
+
+
+plot.harmonic <- function(Xk, i, ts, acq.freq, color="red") {
+  Xk.h <- rep(0,length(Xk))
+  Xk.h[i+1] <- Xk[i+1] # i-th harmonic
+  harmonic.trajectory <- get.trajectory(Xk.h, ts, acq.freq=acq.freq)
+  points(ts, harmonic.trajectory, type="l", col=color)
+}
+
+plot.fourier <- function(fourier.series, f.0, ts) {
+  w <- 2*pi*f.0
+  trajectory <- sapply(ts, function(t) fourier.series(t,w))
+  plot(ts, trajectory, type="l", xlab="time", ylab="f(t)"); abline(h=0,lty=3)
+}
+
+
 xmat <- read.table("uvwp6.txt", sep = ",", skip = 4)
 
 xmat.orig <- xmat
@@ -36,11 +101,137 @@ w.hi <- xmat[,12]
 mag.hi <- sqrt(u.hi**2 + v.hi**2)
 
 mag.spline <- smooth.spline(mag.hi, df = 10)
+
+mag.hist <- hist(mag.hi, breaks = 12)
+break.seq <- rep(NA, length(mag.hi))
+mid.seq <- mag.hist$mids
+
+for(i in 1:length(mag.hi))
+{
+  break.seq[i] <- mid.seq[which.min(abs(mag.spline$y[i] - mid.seq))]
+  
+}
+
+plot(mag.hi, type = "l")
+lines(break.seq, col = "red")
+
+bs.2.5 <- mag.hi[break.seq == 2.5]
+plot(bs.2.5, type = "l")
+xseq <- bs.2.5
+xseq <- xseq - mean(bs.2.5)
+xseq.arima <- auto.arima(xseq)
+summary(xseq.arima)
+tx <- 1:length(xseq)
+xtrend <- lm(xseq ~ tx)
+
+arma.manual <- arma(xseq, order = c(2, 0, 2))
+
+coefvec <- arma.manual$coef
+arcoefs <- grep("ar", names(coefvec))
+macoefs <- grep("ma", names(coefvec))
+asim <- arima.sim(n = 5000, list(order = c(2,0,0), ar = coefvec[arcoefs], ma = coefvec[macoefs], 
+                                 sd = sqrt(xseq.arima$sigma2)))
+plot(asim, type = "l")
+
 plot(mag.hi, type = "l")
 lines(mag.spline, col = "red")
 mag.resids <- mag.hi - mag.spline$y
 
-mag.sub <- mag.resids[10000:14000]
+acf.2.5.100 <- acf(bs.2.5, lag.max = 100)
+acf.6.5.100 <- acf(bs.6.5, lag.max = 100)
+
+ar.2.5.100 <- acf2AR(acf.2.5.100$acf)
+ar.6.5.100 <- acf2AR(acf.6.5.100$acf)
+
+mag.sub <- mag.resids[12000:16000]
+
+acq.freq <- 1
+timemax     <- length(mag.sub) / acq.freq
+tsseq<- seq(0,timemax-1/acq.freq,1/acq.freq) 
+f.0 <- 1/timemax
+
+sm.y <- smooth.spline(trajectory, df = 30)
+navg <- 120
+filt.y <-filter(mag.sub, rep(1 / navg, navg), sides = 2)
+filt.y[is.na(filt.y)] <- mean(na.exclude(filt.y))
+
+trajectory <- filt.y
+f.data <- GeneCycle::periodogram(trajectory)
+harmonics <- 1:(acq.freq/2)
+
+
+plot(f.data$freq[harmonics]*length(trajectory), 
+     f.data$spec[harmonics]/sum(f.data$spec), 
+     xlab="Harmonics (Hz)", ylab="Amplitute Density", type="h")
+nfreqs <- 10
+
+
+sortamps <- sort( f.data$spec[harmonics]/sum(f.data$spec), decreasing = TRUE)
+orderamps <- order(f.data$spec[harmonics]/sum(f.data$spec))
+topamps <- sortamps[1:nfreqs]
+
+freqseq <- f.data$freq[harmonics]*length(trajectory)
+orderfreqs <- rev(freqseq[orderamps])
+topfreqs <- orderfreqs[1:nfreqs]
+
+traj.fit <- rep(0, length(tsseq))
+
+for(curwave in 1:nfreqs)
+{
+  traj.fit <- traj.fit + topamps[curwave]*sin(topfreqs[curwave]*timemax*tsseq)
+  
+}
+traj.fit <- traj.fit / f.0
+plot(traj.fit, type  = "l")
+plot.frequency.spectrum(traj.fit, xlimits=c(0,100))
+
+spec_stats <- spectrum(trajectory)
+plot(spec_stats$freq, spec_stats$spec, type = "l", xlim = c(0, 0.1))
+
+
+TSA_per <- TSA::periodogram(trajectory)
+plot(TSA_per$freq, TSA_per$spec, type = "l", xlim = c(0, 0.1))
+
+nfreqs <- 30
+
+
+sortamps <- sort( TSA_per$spec, decreasing = TRUE)
+orderamps <- order( TSA_per$spec)
+topamps <- sortamps[1:nfreqs]
+
+freqseq <- TSA_per$freq
+orderfreqs <- rev(freqseq[orderamps])
+topfreqs <- orderfreqs[1:nfreqs]
+
+traj.fit <- rep(0, length(tsseq))
+
+for(curwave in 1:nfreqs)
+{
+  traj.fit <- traj.fit + log(topamps[curwave])*sin(topfreqs[curwave]*timemax*tsseq)
+  
+}
+traj.fit <- traj.fit * f.0
+plot(traj.fit, type  = "l")
+plot.frequency.spectrum(traj.fit, xlimits=c(0,100))
+
+
+
+sortamps <- sort( f.data$spec[harmonics]/sum(f.data$spec), decreasing = TRUE)
+orderamps <- order(f.data$spec[harmonics]/sum(f.data$spec))
+topamps <- sortamps[1:nfreqs]
+
+plot(f.data$freq[harmonics]*length(trajectory), 
+     f.data$spec[harmonics]/sum(f.data$spec), 
+     xlab="Harmonics (Hz)", ylab="Amplitute Density", type="h")
+
+
+
+X.k <- fft(mag.sub) 
+plot.frequency.spectrum(X.k, xlimits=c(0,100))
+x.n <- get.trajectory(X.k,tsseq,acq.freq) / acq.freq 
+
+plot(tsseq,x.n, type="l"); abline(h=0,lty=3)
+
 plot(mag.sub, type = "l")
 adf.test(mag.sub)
 manual.arima <- Arima(mag.resids, order = c(2, 1, 1))
@@ -54,12 +245,15 @@ mag.arima$coef
 arvec <- mag.arima$arma
 minroots <- min(Mod(polyroot(c(1, - coef(mag.arima)))))
 
-asim <- arima.sim(n = 5000, list(ar = c(0.2929, -0.1570), 
-          sd = sqrt(0.1493)))
+coefvec <- mag.arima$coef
+arcoefs <- grep("ar", names(coefvec))
+macoefs <- grep("ma", names(coefvec))
+asim <- arima.sim(n = 5000, list(order = c(4,0,1), ar = coefvec[arcoefs], ma = coefvec[macoefs], 
+          sd = sqrt(mag.arima$sigma2)))
 
 plot(asim, type = "l")
 
-ts.sim <- arima.sim(list(order = c(2,1,0), ar =c(0.2929  ,  -0.1570)), n = 4000, sd =  (0.1493))
+ts.sim <- arima.sim(list(order = c(2,1,0), ar =c(0.2929  ,  -0.1570)), n = 4000, sd =  sqrt(0.1493))
 plot(ts.sim, type = "l")
 mag.sim <- arima.sim(mag.arima, 10000)
 
@@ -75,10 +269,15 @@ plot(ratvec, type = "l")
 thetavec <- atan(u.hi / v.hi)
 plot(thetavec, type = "l")
 
-theta.arima <- auto.arima(thetavec)
 theta.resids <- theta.arima$residuals
-
-theta.sim <- arima.sim(theta.arima, 10000)
+theta.arima <- auto.arima(theta.sub)
+theta.sub <- thetavec[10000:14000]
+arima.coef <- coef(theta.arima)
+tsim <- arima.sim(n = 5000, list(order = c(5, 1, 5), ar = arima.coef[1:5], ma = arima.coef[6:10]), 
+                                 sd = sqrt(0.01655))
+plot(tsim, type = "l")
+angseq.sim <- tan(tsim)
+plot(angseq.sim, type = "l")
 
 plot(u.hi, type = "l")
 plot(v.hi, type = "l")
